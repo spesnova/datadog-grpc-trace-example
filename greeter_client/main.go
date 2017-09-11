@@ -20,35 +20,57 @@ package main
 
 import (
 	"log"
-	"os"
+	"net/http"
 
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	pb "google.golang.org/grpc/examples/helloworld/helloworld"
+
+	grpctrace "github.com/DataDog/dd-trace-go/contrib/google.golang.org/grpc"
+	"github.com/DataDog/dd-trace-go/tracer"
 )
 
 const (
-	address     = "localhost:50051"
-	defaultName = "world"
+	address               = "localhost:50051"
+	defaultName           = "world"
+	datadogAPMServiceName = "greeter-client"
 )
 
 func main() {
 	// Set up a connection to the server.
-	conn, err := grpc.Dial(address, grpc.WithInsecure())
+	conn, err := grpc.Dial(
+		address,
+		grpc.WithInsecure(),
+		grpc.WithUnaryInterceptor(
+			grpctrace.UnaryClientInterceptor(datadogAPMServiceName, tracer.DefaultTracer),
+		),
+	)
 	if err != nil {
 		log.Fatalf("did not connect: %v", err)
 	}
 	defer conn.Close()
 	c := pb.NewGreeterClient(conn)
 
-	// Contact the server and print out its response.
-	name := defaultName
-	if len(os.Args) > 1 {
-		name = os.Args[1]
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		rootSpan := tracer.DefaultTracer.NewRootSpan("web.request", datadogAPMServiceName, "/")
+		defer rootSpan.Finish()
+		ctx := rootSpan.Context(r.Context())
+
+		// Contact the server and print out its response.
+		name := defaultName
+		resp, err := c.SayHello(ctx, &pb.HelloRequest{Name: name})
+		if err != nil {
+			rootSpan.FinishWithErr(err)
+			log.Fatalf("[ERROR] Could not greet: %v", err)
+			return
+		}
+
+		w.Header().Add("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(resp.Message + "\n"))
+	})
+
+	if err := http.ListenAndServe(":3000", nil); err != nil {
+		log.Fatalf("[ERROR] Failed to start server: %s", err)
 	}
-	r, err := c.SayHello(context.Background(), &pb.HelloRequest{Name: name})
-	if err != nil {
-		log.Fatalf("could not greet: %v", err)
-	}
-	log.Printf("Greeting: %s", r.Message)
+	log.Println("[INFO] Listening server on :3000")
 }
